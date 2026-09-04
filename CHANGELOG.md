@@ -8,6 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- Wiki commits on Windows no longer fail for an operator whose global git
+  config enables commit signing (`commit.gpgsign = true`) (#NNN). When
+  libgit2 cannot open the wiki repo, the commit falls back to the git CLI,
+  which tried to sign as the synthetic `ai-memory@local` identity, found no
+  key, and left the wiki commit unmade. The fallback now commits unsigned, as
+  the libgit2 path always has, and accepts an empty commit message as libgit2
+  does instead of aborting.
 - `bootstrap` now retries a chunk's LLM call on a transient error before
   giving up, instead of letting one blip discard the whole multi-chunk run
   (#617). A provider `5xx`/`429` or a transport timeout/connect failure on

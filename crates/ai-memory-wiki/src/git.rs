@@ -224,6 +224,31 @@ impl GitAdapter {
     }
 }
 
+/// Arguments for the Windows git-CLI commit fallback. Must produce the same
+/// commit libgit2 would: the shared identity constants, unsigned
+/// (`--no-gpg-sign`; libgit2 cannot sign, and `commit.gpgsign = true` fails
+/// for an identity with no key), and empty messages allowed. Known gap: the
+/// CLI still runs hooks (`core.hooksPath`); add `--no-verify` if that bites.
+#[cfg(any(windows, test))]
+fn fallback_commit_args(message: &str) -> Vec<String> {
+    let name = format!("user.name={COMMIT_AUTHOR_NAME}");
+    let email = format!("user.email={COMMIT_AUTHOR_EMAIL}");
+    [
+        "-c",
+        &name,
+        "-c",
+        &email,
+        "commit",
+        "--no-gpg-sign",
+        "--allow-empty-message",
+        "-q",
+        "-m",
+        message,
+    ]
+    .map(String::from)
+    .into()
+}
+
 #[cfg(windows)]
 fn commit_all_fallback(
     root: &Path,
@@ -245,19 +270,7 @@ fn commit_all_fallback(
     if diff.success() {
         return Ok(None);
     }
-    run_git(
-        root,
-        [
-            "-c",
-            "user.name=ai-memory",
-            "-c",
-            "user.email=ai-memory@local",
-            "commit",
-            "-q",
-            "-m",
-            message,
-        ],
-    )?;
+    run_git(root, fallback_commit_args(message))?;
     let out = git_output(root, ["rev-parse", "HEAD"])?;
     let oid = String::from_utf8_lossy(&out.stdout);
     git2::Oid::from_str(oid.trim())
@@ -408,7 +421,11 @@ fn init_repo_fallback(_root: &Path, original: git2::Error) -> WikiResult<()> {
 }
 
 #[cfg(windows)]
-fn run_git<const N: usize>(root: &Path, args: [&str; N]) -> WikiResult<()> {
+fn run_git<I, S>(root: &Path, args: I) -> WikiResult<()>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
     let status = std::process::Command::new("git")
         .arg("-C")
         .arg(root)
@@ -581,5 +598,61 @@ mod tests {
             .file_at_rev(&first.to_string(), Path::new("a.md"))
             .unwrap();
         assert_eq!(String::from_utf8(bytes).unwrap(), "one");
+    }
+
+    /// Cross-platform so every CI leg runs it. Order matters: `-c` after
+    /// `commit` would mean "reuse that commit's message", and `-m` must be
+    /// last so the message is never parsed as an option.
+    #[test]
+    fn fallback_commit_args_never_sign_and_keep_git_cli_order() {
+        assert_eq!(
+            fallback_commit_args("some message"),
+            [
+                "-c",
+                "user.name=ai-memory",
+                "-c",
+                "user.email=ai-memory@local",
+                "commit",
+                "--no-gpg-sign",
+                "--allow-empty-message",
+                "-q",
+                "-m",
+                "some message",
+            ]
+        );
+    }
+
+    /// Real CLI fallback against a repo whose local config demands signing
+    /// with a nonexistent key, then an empty message. Local config keeps the
+    /// test hermetic; the flags override it exactly as they override global.
+    #[cfg(windows)]
+    #[test]
+    fn cli_fallback_commits_under_signing_config_and_with_an_empty_message() {
+        let tmp = tempdir();
+        let root = tmp.path().join("wiki");
+        let adapter = GitAdapter::open_or_init(&root).unwrap();
+        let repo = Repository::open(&root).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_bool("commit.gpgsign", true).unwrap();
+        config
+            .set_str("user.signingkey", "0000000000000000")
+            .unwrap();
+
+        std::fs::write(root.join("foo.md"), "hello").unwrap();
+        let oid = commit_all_fallback(&root, "add foo", git2::Error::from_str("forced"))
+            .unwrap()
+            .expect("fallback should commit the staged file");
+        let commit = repo.find_commit(oid).unwrap();
+        assert_eq!(commit.author().name().unwrap(), COMMIT_AUTHOR_NAME);
+        assert_eq!(commit.author().email().unwrap(), COMMIT_AUTHOR_EMAIL);
+        assert_eq!(commit.summary().unwrap(), Some("add foo"));
+        assert_eq!(adapter.commit_count(), 1);
+
+        std::fs::write(root.join("bar.md"), "world").unwrap();
+        let oid = commit_all_fallback(&root, "", git2::Error::from_str("forced"))
+            .unwrap()
+            .expect("fallback should commit with an empty message");
+        assert_eq!(repo.find_commit(oid).unwrap().message_bytes(), b"");
+        assert_eq!(adapter.commit_count(), 2);
     }
 }
