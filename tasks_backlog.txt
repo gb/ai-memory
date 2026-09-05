@@ -1,0 +1,279 @@
+ai-memory — SECURITY / ENTERPRISE HARDENING BACKLOG
+====================================================
+
+Source: architecture / security / enterprise review of the tree at
+commit 47c9cf2 (branch fix/opaque-auth-header-redaction), 2026-09-03.
+
+Scope rule for this list: every item is intentionally SMALL — a single
+mergeable PR, no cross-cutting rewrites. Ordered by gain per unit of
+effort, not by severity alone.
+
+Legend:
+  [EFFORT]  rough size of the diff
+  [GAIN]    why it is worth doing
+  [BREAKS]  backwards-compatibility impact, if any
+
+
+------------------------------------------------------------------------
+TIER A — do these first (highest ratio; 1 is a real hole, 2-3 are gates)
+------------------------------------------------------------------------
+
+1. Split `Capability::Destructive` out of `Capability::Admin`
+   FILES  crates/ai-memory-core/src/actor.rs:124  (Capability enum)
+          crates/ai-memory-core/src/actor.rs:184  (the permissive arm:
+            `Capability::Admin if !distinguishes_operators => Ok(())`)
+          crates/ai-memory-mcp/src/admin.rs:580-632 (re-tag ~8 handlers)
+
+   WHAT   In the default single-user install, AuthLevel::Anonymous is
+          silently granted full admin. Add one enum variant that never
+          passes for Anonymous regardless of `distinguishes_operators`,
+          and tag the destructive/bulk-read routes with it:
+            /admin/purge-project      /admin/purge-session
+            /admin/delete-workspace   /admin/delete-page
+            /admin/backup             /admin/export-okf
+            /admin/audit-log          /admin/compact
+          Leave /admin/status, /admin/projects, /admin/search on the
+          existing permissive Admin capability so local-dev ergonomics
+          survive.
+
+   [EFFORT] ~60 lines + a table-driven test over (AuthLevel x Capability)
+   [GAIN]   Removes the sharpest real risk in the codebase: any local
+            process running as the same OS user (malicious npm/pip
+            postinstall, compromised editor extension, another account on
+            a shared dev host) can today hit 127.0.0.1:49374 with no
+            credential and exfiltrate the full SQLite via /admin/backup,
+            read any project's pages, or destroy everything.
+   [BREAKS] Only for anyone scripting unauthenticated /admin/purge-* on
+            loopback — a break you want.
+
+
+2. Sign releases: build provenance + SBOM (+ optional cosign)
+   FILES  .github/workflows/release.yml:355  (`provenance: false`)
+          .github/workflows/release.yml:415  (`provenance: false`)
+          .github/workflows/release.yml:~505 (artifact staging job)
+
+   WHAT   (a) flip `provenance: true` on both docker/build-push-action
+              calls — the capability is already available and explicitly
+              turned off;
+          (b) add actions/attest-build-provenance for the binary tarballs
+              and the Windows zip;
+          (c) add `cargo cyclonedx` and publish the SBOM as a release
+              asset;
+          (d) optional: `cosign sign-blob --yes` with keyless OIDC.
+
+   [EFFORT] ~40 lines of YAML. Zero Rust.
+   [GAIN]   Best ratio on the whole list. Releases currently ship SHA-256
+            companions and nothing else. SBOM + SLSA provenance are hard
+            gates on most enterprise OSS intake checklists.
+   [BREAKS] Nothing.
+
+
+3. `AI_MEMORY_OFFLINE=1` — a real air-gap kill switch
+   FILES  crates/ai-memory-llm/src/local.rs:50 (hardcoded HuggingFace URL
+            for the ~87 MB all-MiniLM-L6-v2 fetch)
+          crates/ai-memory-llm/src/factory.rs (provider construction)
+          Config (one new key + env binding)
+
+   WHAT   A single flag that fails closed on: the startup model download,
+          every LLM provider construction, the LLM reranker, and remote
+          embedding APIs. Log it loudly at startup next to the existing
+          absolute-data-dir line. Document a preseed path
+          (<data_dir>/models/) so offline installs still get local
+          embeddings.
+
+   [EFFORT] one config field threaded to three call sites, ~80 lines
+   [GAIN]   Unblocks restricted-network and air-gapped deployment. Gives
+            operators one auditable "nothing leaves this box" assertion
+            instead of having to reason across embedding_provider,
+            reranker, and provider config independently. Also kills the
+            surprise unattended 87 MB network fetch on first start.
+   [BREAKS] Nothing (opt-in flag).
+
+
+------------------------------------------------------------------------
+TIER B — default-safety flips (small diffs, big posture change)
+------------------------------------------------------------------------
+
+4. Make capture mode fail CLOSED and enforce it server-side
+   FILES  crates/ai-memory-cli/src/commands/hook.rs:868-871
+            (`_ => CaptureMode::Denylist` — fails OPEN on an unreadable
+             or missing mode file)
+          crates/ai-memory-cli/src/commands/install_hooks.rs:693
+          crates/ai-memory-hooks/src/router.rs (server-side re-check)
+
+   WHAT   (a) change the fallback arm to CaptureMode::Allowlist;
+          (b) make --capture-mode a required explicit choice in
+              install-hooks rather than a defaulted Option;
+          (c) send the resolved mode with each hook POST and re-check it
+              server-side — today the gate is client-side only and the
+              server ingests whatever arrives.
+
+   [EFFORT] ~100 lines across hook command, installer, router
+   [GAIN]   The code comment at capture_policy.rs:33 already states the
+            problem: under the Denylist default "a repository with no
+            marker is captured, so forgetting a marker leaks." This is
+            the difference between "we capture unless told not to" and
+            something that survives a privacy review.
+   [BREAKS] Yes — existing installs relying on implicit capture. Needs a
+            CHANGELOG entry and a migration note.
+
+
+5. Emit every audit row as a structured tracing event
+   FILES  crates/ai-memory-store/src/ops.rs:3000  (fn audit)
+          crates/ai-memory-store/src/ops.rs:3025  (fn audit_with_detail)
+
+   WHAT   Every audit write already funnels through these two functions.
+          Add one call:
+            tracing::info!(target: "ai_memory::audit",
+                           op, workspace_id, project_id, author_id, detail)
+          Operators then route the `ai_memory::audit` target to a file,
+          syslog, or an OTLP collector using the subscriber config that
+          already exists.
+
+   [EFFORT] ~15 lines
+   [GAIN]   Best line-for-line compliance win available. Turns an audit
+            log that lives in the same SQLite an admin can purge into
+            something exportable and append-only off-box.
+   [BREAKS] Nothing.
+
+
+6. Ship operator `extra_patterns` down to the client sanitizer
+   FILES  the gap is documented at SECURITY.md:92
+          crates/ai-memory-cli/src/commands/install_hooks.rs
+          new small authenticated endpoint (or bake into generated hook
+          config)
+
+   WHAT   Client-side scrub currently uses built-in patterns only;
+          operator [sanitize] extra_patterns run server-side only. Fetch
+          them at install time so the client has parity. Compile-validate
+          client-side with the same abort-on-invalid-regex behavior as
+          server startup.
+
+   [EFFORT] one endpoint + installer plumbing, ~120 lines
+   [GAIN]   Closes a known, documented case: a secret matching only your
+            custom corporate token rule sits in cleartext on the client
+            spool and on the wire before the server ever redacts it.
+            "Your custom rules don't protect the wire" is hard to defend.
+   [BREAKS] Nothing.
+
+
+7. Default `[auto_improve] require_approval = true`
+   FILES  crates/ai-memory-cli/templates/config.default.toml
+
+   WHAT   One-line default flip. The scheduler stays enabled; proposals
+          land in _pending/auto-improve for
+          `ai-memory pending-writes approve <id>` instead of writing
+          straight through the wiki path.
+          NOTE: [auto_improve.eval] enabled = false is ALREADY the safe
+          default — no change needed there.
+
+   [EFFORT] one line + CHANGELOG entry
+   [GAIN]   Today a background LLM pass autonomously writes rule pages
+            that shape every future agent session, unattended. A human
+            gate by default costs almost nothing and removes the most
+            surprising behavior in the product.
+   [BREAKS] Behavior change for existing configs that omit the key.
+
+
+------------------------------------------------------------------------
+TIER C — operability and reviewability
+------------------------------------------------------------------------
+
+8. Declarative route -> capability table + exhaustiveness test
+   FILES  crates/ai-memory-mcp/src/admin.rs:580-632
+
+   WHAT   Do NOT refactor the 12,028-line file. Just extract the routing
+          table into
+            const ADMIN_ROUTES: &[(&str, Method, Capability)]
+          and build the router from it. Add one test asserting every
+          registered route appears in the table, so adding a handler
+          without declaring its capability fails CI.
+
+   [EFFORT] ~150 lines, mechanical
+   [GAIN]   The entire authorization surface becomes readable in one
+            screen, and "someone adds a route and forgets the auth check"
+            — the drift class a 12k-line file guarantees, and where
+            authorization bugs almost always come from — becomes
+            structurally impossible. This is the small version of
+            "decompose admin.rs" and captures most of the value.
+   [BREAKS] Nothing.
+
+
+9. A /metrics Prometheus endpoint
+   FILES  new; mount next to the existing healthcheck
+          deps: metrics + metrics-exporter-prometheus
+
+   WHAT   ~10 counters/gauges at hook points that already exist:
+            - hook ingests accepted / rejected 429
+            - writer-actor queue depth
+            - consolidation runs and failures
+            - provider call latency and error rate
+            - KDF saturation rejections (password.rs:22 KDF_PENDING_LIMIT)
+            - forget-sweep deletions
+            - DB size on disk
+
+   [EFFORT] ~200 lines
+   [GAIN]   There is currently ZERO telemetry integration anywhere in the
+            tree (no opentelemetry, no prometheus, no /metrics). You
+            cannot page on this, dashboard it, or notice the hook path is
+            shedding load. Table stakes for anything running as a service.
+   [BREAKS] Nothing.
+
+
+10. `ai-memory doctor` — runtime posture check
+    FILES  new thin CLI command following the crates/ai-memory-cli/src/
+           commands/status.rs pattern
+
+    WHAT   Print and grade the live posture; exit non-zero on anything
+           dangerous:
+             - bind address vs. whether auth is configured
+             - allowed_hosts
+             - capture mode + marker coverage across known projects
+             - LLM provider configured? which paths egress?
+             - capture_assistant
+             - auto_improve.require_approval
+             - data-dir permissions (0700/0600 logic already exists)
+             - secure_cookie vs. bind address
+             - number of DB users (i.e. is admin still anonymous-open?)
+             - observation retention setting
+
+    [EFFORT] ~250 lines, mostly formatting — every input is already
+             resolved in Config
+    [GAIN]   Converts SECURITY.md from a document nobody reads into a
+             check people run. Also the artifact you hand a reviewer,
+             which shortens every future security conversation about
+             this tool.
+    [BREAKS] Nothing.
+
+
+------------------------------------------------------------------------
+DELIBERATELY NOT ON THIS LIST — real wins, but not small
+------------------------------------------------------------------------
+
+- Encrypted backups (age/passphrase or KMS): ~1-2 days, and the key
+  management is a design decision, not a task.
+- Entropy-based second sanitizer stage to complement the prefix regexes
+  in crates/ai-memory-core/src/sanitize.rs:55-145: false-positive tuning
+  IS the whole job.
+- Documented egress data-flow diagram covering consolidation, reranker,
+  embeddings, and auto-improve: doc-only, but needs the maintainer's
+  knowledge more than code.
+- Per-user / per-project ACLs, SSO (SAML/OIDC RP with group mapping),
+  SCIM: genuinely large. Do not attempt as small tasks.
+- Decomposing router.rs (12,271), admin.rs (12,028), server.rs (11,377),
+  ops.rs (>9,000). Item 8 is the affordable slice of this.
+
+
+------------------------------------------------------------------------
+ORDERING RATIONALE
+------------------------------------------------------------------------
+
+Tier A: one closes a genuine local-privilege hole; two are almost pure
+CI/config yet clear hard enterprise intake gates.
+
+Tier B: default-safety flips. Small diffs, but each inverts a behavior
+from "leaks unless configured" to "safe unless configured otherwise" —
+which is the polarity reviewers actually check.
+
+Tier C: does not fix a vulnerability; makes the next one findable and
+the service operable.

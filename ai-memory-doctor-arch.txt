@@ -1,0 +1,566 @@
+ai-memory doctor — FOUNDATION & v1 ARCHITECTURE
+===============================================
+
+Corrected design, post-review. Supersedes the first architecture draft.
+Written 2026-09-03 against the tree at commit 47c9cf2.
+Companion to ai-memory-doctor.txt (product vision) and tasks_backlog.txt
+(item 10).
+
+Design brief: clean, simple, small. Steal from doctors that worked;
+avoid what killed the ones that didn't. Every abstraction must be paid
+for by a test that needs it.
+
+
+========================================================================
+1. PRIOR ART — WHAT WE TAKE, WHAT WE AVOID
+========================================================================
+
+  TAKE                                    FROM
+  --------------------------------------  ------------------------------
+  Semantic kebab IDs                      Clippy, ESLint, OpenSSF
+  ("exposure/anonymous-admin")            Scorecard
+  Named suppression of checks             kubeadm
+                                          --ignore-preflight-errors
+  Ignore list in the config file, with    cargo-deny — ALREADY IN THIS
+  a comment justifying each entry         REPO (deny.toml)
+  Compact vitals block instead of         gh auth status
+  per-check green lines
+  Category summary, -v to drill down      flutter doctor
+  Severity threshold drives exit code     trivy, docker scout
+  A remediation string on every finding   OpenSSF Scorecard
+  0 / 1 / 2 where 2 means "tool broke"    grep, diff, shellcheck, rg
+
+  AVOID                                   LESSON FROM
+  --------------------------------------  ------------------------------
+  Shipping every check anyone can think   brew doctor — its output now
+  of; mixing trivia with emergencies      apologizes for itself
+  Numeric IDs needing a lookup table      Lynis (AUTH-9308)
+  A hardening score                       Lynis — scores are gimmicks
+  Network calls in the default path       npm doctor
+
+We are not inventing a diagnostic framework. We are writing twelve
+functions and a printer.
+
+
+========================================================================
+2. CORE DESIGN
+========================================================================
+
+Everything follows from one split:
+
+    IO happens once, up front       ->  Facts    (plain data, Serialize)
+    Judgment is a pure function     ->  Checks   (fn(&Facts) -> Option<Finding>)
+    Presentation is a pure function ->  Renderers (fn(&Report) -> String)
+
+This buys four things the requirements demand:
+
+  - "No network by default" is a COMPILE-TIME guarantee: the local
+    collector's signature does not accept an HTTP client.
+  - Every check is testable with a struct literal. No tempdir, no
+    server, no async. This is the table-driven style AGENTS.md requires.
+  - --json and --explain are free: same Report, different printer.
+  - Output is deterministic, so CI catches drift instead of users.
+
+Definition, pinned now: "no network" means NO EGRESS OFF-BOX. Loopback
+to our own server is required and permitted.
+
+Invariant alignment:
+  #1  one config-read path   — the CLI reads Config once and populates
+                               Facts. Doctor never reads config or env.
+  #2  single-writer actor    — doctor is READ-ONLY. It imports the read
+                               pool and never the writer API.
+  #9  live-process guard     — not needed; doctor only reads. Unlike
+                               reset/reindex it never touches the write
+                               lock.
+
+
+========================================================================
+3. THE TYPES
+========================================================================
+
+The whole foundation, ~60 lines:
+
+    /// Everything we learned, in one pass. Missing means missing.
+    pub struct Facts {
+        pub runtime:  RuntimeFacts,
+        pub exposure: ExposureFacts,
+        pub privacy:  PrivacyFacts,
+        pub server:   Option<ServerFacts>,
+        pub store:    Option<StoreFacts>,
+        pub projects: Option<Vec<ProjectFacts>>,
+        pub agents:   Option<Vec<AgentFacts>>,
+        pub disk:     Option<DiskFacts>,
+        /// What we could not read, and why. Rendered as one line.
+        pub unavailable: Vec<(&'static str, String)>,
+    }
+
+    pub enum Severity { Block, Warn, Note }
+
+    pub struct Finding {
+        pub id:       &'static str,
+        pub severity: Severity,
+        pub headline: String,         // one sentence, consequence first
+        pub evidence: Vec<String>,    // the observed values behind it
+        pub fix:      Option<String>, // a runnable command
+    }
+
+    pub struct Check {
+        pub id:  &'static str,        // "exposure/anonymous-admin"
+        pub doc: &'static str,        // anchor into docs/doctor.md
+        pub run: fn(&Facts) -> Option<Finding>,
+    }
+
+    pub const CHECKS: &[Check] = &[
+        Check { id:  "exposure/anonymous-admin",
+                doc: "#anonymous-admin",
+                run: exposure::anonymous_admin },
+        // … 11 more
+    ];
+
+    pub struct Report {
+        pub vitals:   Vitals,
+        pub findings: Vec<Finding>,
+        pub skipped:  Vec<(&'static str, String)>,
+        pub passed:   usize,
+    }
+
+    pub fn run(facts: &Facts, ignore: &[String]) -> Report
+
+Notes on each decision:
+
+  IDS ARE STRINGS ON THE CHECK, NOT AN ENUM.
+    The check owns its identity: ONE edit site to add a check. An enum
+    would add a variant and a catalog row for zero safety — nothing in
+    the design ever matches over all ids. Stability is enforced by a
+    golden file listing every id: adding a line passes, changing or
+    removing one fails CI.
+
+  IDS ARE SEMANTIC, NOT NUMERIC.
+    "exposure/anonymous-admin" is self-documenting, greppable, sorts
+    sensibly, needs no numbering committee, and reads correctly in an
+    ignore list. EXP-002 is meaningless without a lookup table and
+    creates renumbering pressure the first time two PRs both want -007.
+
+  MISSING DATA IS Option, NOT A WRAPPER TYPE.
+    A failed probe must never render as a pass. The solution is not a
+    generic wrapper on ten fields — it is: if a fact is missing, the
+    check that needs it returns None and the collector records why, once,
+    in `unavailable`. The renderer prints one honest line:
+        3 checks skipped — store unavailable: database is locked
+
+  THREE SEVERITIES.
+    Pass and Unknown are not findings; they are the absence of one. A
+    check that finds nothing returns None. A fourth level costs deleting
+    one first.
+
+  NO POSTURE INPUT TO CHECKS.
+    Posture is a LABEL DERIVED FROM THE FINDINGS, never an input to them.
+    Feeding a computed mode back into checks is a rules engine in
+    disguise. The context-dependence it was meant to solve dissolves
+    under a better check name: "exposure/no-auth-token" is
+    context-dependent; "exposure/anonymous-admin" — unauthenticated
+    callers can download and destroy the store — is true and worth
+    stating on a laptop too. The user reads it, decides it is
+    acceptable, and ignores it by name.
+
+  VITALS ARE NOT CHECKS.
+    "hooks firing, claude-code 2m ago" is valuable but has no verdict.
+    Vitals = what is true. Findings = what is wrong. Separating them
+    keeps checks producing only problems (the brew/flutter/kubeadm
+    model) while preserving "prove it, don't assert it".
+
+
+========================================================================
+4. MODULE LAYOUT
+========================================================================
+
+Start inside the CLI crate. No new crate.
+
+  crates/ai-memory-cli/src/commands/doctor/
+  ├── mod.rs         arg handling; collect -> run -> print -> exit
+  ├── facts.rs       Facts + collectors (the only IO)
+  ├── checks.rs      CHECKS table + the 12 functions
+  └── render.rs      human + json printers (pure fn(&Report) -> String)
+
+AGENTS.md says keep CLI commands thin. Thin means no logic in the arg
+parser — not "must be a separate crate". The facts/checks/render split
+is enforced by module boundary.
+
+EXTRACT A CRATE WHEN, AND ONLY WHEN, one of these is true:
+  - a second consumer appears (/admin/doctor route, or an MCP tool), or
+  - the directory passes ~800 lines.
+The extraction is a mechanical `git mv` plus a Cargo.toml. Doing it up
+front erects scaffolding before a single check has met a real install.
+
+
+========================================================================
+5. THE SCREEN
+========================================================================
+
+$ ai-memory doctor
+
+  ai-memory 2.0.1 · ~/.ai-memory · server up 3d · 1,284 pages · 31 projects
+
+  capture   ● on, opt-out · last event 2m ago (claude-code, codex)
+  egress    ● api.anthropic.com consolidation · api.openai.com embeddings
+  access    ● loopback · no auth · 0 users
+  storage   ● 340 MB · +1.1 GB/mo · backup 19d ago
+
+  ✗ exposure/anonymous-admin
+      Any local process can download or destroy the entire store.
+      no auth token · 0 db users · bind 127.0.0.1:49374
+      fix  ai-memory generate-auth-token
+
+  ✗ privacy/cloud-embeddings
+      Every page is sent to api.openai.com in full, on every write.
+      1,284 pages · embedding_provider = "openai"
+      fix  ai-memory config set embedding_provider=local && ai-memory embed --rebuild
+
+  ! privacy/unmarked-repos
+      12 of 31 projects are captured with no .ai-memory.toml marker.
+      capture_mode = denylist — absence of a marker means capture
+      fix  ai-memory install-hooks --capture-mode allowlist
+
+  ! health/hooks-never-fired
+      cursor hooks installed 6d ago, zero events received.
+      fix  ai-memory install-hooks --agent cursor --verify
+
+  ! durability/stale-backup
+      Last backup 19 days ago (Aug 15).
+      fix  ai-memory backup ~/backups
+
+  2 blocking · 3 warnings · 7 passed        ai-memory doctor --explain <id>
+
+ASCII fallback under NO_COLOR / non-TTY / TERM=dumb:
+  ✗ -> [x]      ! -> [!]      ● -> *      · -> |
+This is not optional. The repo already carries powershell_utf8.rs and
+powershell_home.rs tests because it has been bitten here before; the
+renderer PR gets the `windows` label.
+
+The egress tree from the earlier draft is now one vitals line and moves
+behind --verbose. Default output MUST fit one screen without scrolling.
+
+
+========================================================================
+6. v1 CHECK CATALOG — 12 CHECKS
+========================================================================
+
+  exposure/anonymous-admin      Unauthenticated callers reach admin
+                                routes (no token AND zero db users).
+  exposure/unauthenticated-bind Non-loopback bind with no auth token.
+  exposure/insecure-cookie      secure_cookie=false behind an HTTPS proxy,
+                                or true on direct HTTP.
+
+  privacy/cloud-embeddings      Remote embedding provider ships full page
+                                text on every write.
+  privacy/unmarked-repos        capture_mode=denylist with N captured
+                                projects lacking a marker.
+  privacy/assistant-capture     capture_assistant on, especially with a
+                                cloud provider configured.
+  privacy/world-readable-data   Data dir or db file wider than 0700/0600.
+
+  health/server-unreachable     Loopback probe failed; memory is not
+                                being captured right now.
+  health/hooks-never-fired      Agent hooks installed but zero events
+                                received since install.
+  health/consolidation-stalled  Completed sessions pending beyond the
+                                scheduler interval.
+
+  durability/stale-backup       Last backup older than 14 days (from the
+                                audit_log 'backup' op — no new tracking).
+  durability/disk-pressure      Free space below projected 90-day growth.
+
+DELIBERATELY NOT CHECKS (they became vitals or --json fields):
+  request body cap (a compiled-in constant), encryption-at-rest note,
+  ignore_paths configured, no-LLM-provider note, WAL size, hook spool
+  depth, allowed_hosts contents, tool count, embedding coverage,
+  git checkpoint count, version currency.
+
+Each of those failed the test: no verdict and no fix => not a finding.
+Six of them appeared as checks in the first draft. That is exactly how
+brew doctor became unreadable.
+
+ONE PREREQUISITE: health/hooks-never-fired needs an install manifest
+that does not exist yet. install_hooks.rs:693 already persists capture
+mode to a data-dir file, so there is precedent. Add:
+
+    <data_dir>/hooks/installed.json
+      [{ "agent": "cursor", "installed_at": …, "version": "2.0.1" }]
+
+written by install-hooks, removed by uninstall, joined by doctor against
+MAX(observations.at) grouped by agent kind. Ship it as its own small PR;
+it is independently useful for support triage.
+
+
+========================================================================
+7. REDACTION — DEFAULT ON
+========================================================================
+
+The highest-value use of this command is "paste the output into your bug
+report". This is a diagnostic tool for a PRIVACY product; its output will
+be pasted into public GitHub issues.
+
+DEFAULT (both human and --json):
+  - home directory rendered as ~
+  - project names replaced by a short stable digest: proj:a4f2
+  - usernames, hostnames, and absolute paths outside the data dir elided
+  - counts, timings, versions, config keys and provider hostnames kept —
+    they carry the diagnostic value and leak nothing
+
+--full opts back in and prints a one-line warning that the output
+contains local identifiers.
+
+TEST: golden assertion that default --json contains no $HOME substring
+and no project name from the registry fixture.
+
+The first draft's mockup printed "~/work/client-hipaa-portal". That is
+the defect this section exists to prevent, and it would have shipped.
+
+
+========================================================================
+8. CLI SURFACE AND EXIT CODES
+========================================================================
+
+  ai-memory doctor                     human output, redacted
+  ai-memory doctor --json              machine output, redacted, schema 1
+  ai-memory doctor --explain <id>      long form + docs anchor + rationale
+  ai-memory doctor --verbose           vitals detail, egress tree, passing ids
+  ai-memory doctor --full              disable redaction (warns)
+  ai-memory doctor --exit-code-on X    block (default) | warn | note
+  ai-memory doctor --ignore <id>       one-off, repeatable
+  ai-memory doctor --no-ignore         disregard the config ignore list
+  ai-memory doctor --timings           per-collector ms
+
+EXIT CODES — conventional, and NOT what the first draft proposed:
+
+    0   no findings at or above the threshold
+    1   findings at or above the threshold
+    2   doctor could not run (unreadable data dir, bad config)
+
+Reserving the top code for "the tool itself failed" is what grep, diff,
+shellcheck and rg all do. The first draft used 2 for "blocking findings",
+making a broken doctor indistinguishable from a working one that found
+problems. That mistake would have landed in a hundred CI configs.
+
+--json NEVER colors, never wraps, never inspects the TTY.
+
+
+========================================================================
+9. SUPPRESSION
+========================================================================
+
+Copy deny.toml. It is already in this repo and every Rust developer
+knows the idiom.
+
+    # config.toml
+    [doctor]
+    ignore = [
+      # Single-user laptop, FileVault on, no other local accounts.
+      "exposure/anonymous-admin",
+    ]
+
+The comment carries the justification. `git blame` carries who and when.
+The PR that adds a line carries the review. Zero new state files, zero
+invalidation logic, zero auto-reopen semantics.
+
+Ignored findings are omitted from the default view and listed in --json
+under `ignored` so nothing is invisible to tooling.
+
+REJECTED: an `--accept <id> --reason` register with persistence and
+auto-reopen-on-config-change. That is a feature with state and
+invalidation rules, invented to replace something a TOML comment already
+does better.
+
+
+========================================================================
+10. TESTING
+========================================================================
+
+  Checks        Table-driven and pure. Facts::default() with ONE field
+                mutated per case. At least a positive and a negative per
+                check. Milliseconds for the whole suite.
+  Ids           Golden file listing every check id. Adding passes;
+                changing or removing fails.
+  JSON          Golden snapshot — it is a contract. Schema version 1
+                declared from the first commit.
+  Human output  NOT golden-tested. Golden files on cosmetic output become
+                a re-bless reflex and stop catching anything by month
+                three. Assert invariants instead: contains the id,
+                contains the fix command, no ANSI when stdout is not a
+                TTY, ASCII-only under NO_COLOR.
+  Redaction     Assert no $HOME and no registry project name in default
+                --json.
+  Collectors    tempdir + injected roots only. Never the real home
+                directory (explicit AGENTS.md rule).
+  Query budget  Assert the default run issues no more than N SQL queries.
+                A query-count assertion is stable; a wall-clock assertion
+                is flaky.
+  E2E           One test in tests/: start server -> doctor exits 1 ->
+                apply the printed remedy -> exits 0. Proves the fixes are
+                real commands, not prose.
+
+
+========================================================================
+11. PERFORMANCE
+========================================================================
+
+Target: under 500 ms on a 1 GB store, cold cache. This is a constraint,
+not an aspiration, and it decides real things:
+
+  PRAGMA integrity_check   --deep only. Default uses quick_check plus WAL
+                           size and last-checkpoint age.
+  Marker coverage          Read project roots from the existing project
+                           registry and stat only those. NEVER walk the
+                           filesystem. Cap at 200 projects and STATE the
+                           truncation — a silent cap reads as "we checked
+                           everything".
+  Row counts               Reuse the indexed counters `status` already
+                           computes.
+  Retrieval probe          Deferred out of v1. When added: one bounded
+                           FTS query, LIMIT 5, hard timeout.
+  Parallel collectors      Not in v1. Sequential, measure with --timings,
+                           parallelize only if the budget is missed.
+
+
+========================================================================
+12. DEGRADATION — THE CASES THAT DECIDE IF THIS IS TRUSTWORTHY
+========================================================================
+
+Three states must produce useful output. Each is a test.
+
+  NO DATA DIR / NOT INITIALIZED
+    Exactly one finding: run `ai-memory init`. No spurious warnings about
+    an absent config. Exit 1.
+
+  SERVER NOT RUNNING
+    All store reads still work against the file via the read-only pool.
+    Facts.server is None. health/server-unreachable fires as Warn, not
+    Block — "I haven't started it yet" is normal.
+
+  DB LOCKED OR CORRUPT
+    Store collectors record into `unavailable`. Dependent checks return
+    None and are counted as skipped, never as passed. Exit 1, never 0.
+
+Reading SQLite while the writer is live is safe by design: WAL mode plus
+the existing read-only pool is exactly the intended pattern.
+
+
+========================================================================
+13. THE FIVE RULES — THE ACTUAL FOUNDATION
+========================================================================
+
+These go in docs/doctor.md where reviewers can point at them. They are
+what keeps this from becoming brew doctor over the next twenty PRs.
+
+  1. ONE EDIT SITE.
+     Adding a check = one function plus one line in CHECKS. If it ever
+     takes three edits, the abstraction is wrong. Fix the abstraction,
+     not the check.
+
+  2. NO VERDICT AND NO FIX => NOT A FINDING.
+     It is a vital sign or a --json field. This is the rule that kills
+     the noise, and the one the first draft broke six times.
+
+  3. Block REQUIRES OBSERVED VALUES, NEVER INFERENCE.
+     Print them in the evidence lines or downgrade. A false Block teaches
+     people to ignore the tool; one bad finding costs more than ten
+     missing ones. "Your sanitizer might miss secrets" can never be a
+     Block — it is not even a finding.
+
+  4. CHECKS ARE PURE.
+     No IO below collect. Every check testable with a struct literal.
+
+  5. DEFAULT OUTPUT FITS ONE SCREEN.
+     When it does not, something gets cut or demoted — not --verbose'd
+     away. A doctor you scroll is a doctor you skim.
+
+Rule 5 is load-bearing. Every doctor command that rotted, rotted because
+nobody had a budget for the output. A fixed screen budget forces the
+trade-off in every future PR, permanently, without anyone having to
+remember this document.
+
+
+========================================================================
+14. MERGE SEQUENCE — THREE PRs
+========================================================================
+
+  PR 1  commands/doctor/{mod,facts,checks,render}.rs
+        5 checks: 3 exposure + 2 privacy
+        vitals block, human renderer, ASCII fallback
+        redaction, exit codes, docs/doctor.md, CHANGELOG
+        => a working, useful command on day one
+
+  PR 2  --json (schema 1, golden), --explain,
+        [doctor] ignore in config, --exit-code-on, --verbose
+
+  PR 3  hook install manifest in install-hooks (+ uninstall cleanup)
+        remaining health + durability checks
+
+PR 1 must be independently useful. That is the only sequencing rule that
+matters. The first draft's eight-PR plan erected a crate, four modules
+and a golden-test harness before anyone learned anything.
+
+
+========================================================================
+15. REJECTED DESIGNS — THE ANTI-COMPLEXITY LEDGER
+========================================================================
+
+Recorded so nobody re-adds them without new evidence.
+
+  Probed<T> { Known(T), Unavailable(String) }
+    -> That is Result<T, String> with a hat. A generic wrapper on ten
+       fields, forcing every check to pattern-match, to solve something
+       Option plus one `unavailable` list solves. A type was added before
+       a test needed it.
+
+  CheckId enum + CheckMeta catalog module
+    -> Justified with "exhaustiveness", but nothing ever matches over all
+       ids. Bought zero safety, cost three edit sites per check.
+
+  Numeric ids (EXP-002)
+    -> Renumbering pressure, meaningless without a lookup table.
+
+  Posture as an input to checks
+    -> A rules engine in disguise, and self-contradictory: the same
+       document listed "no rules DSL" as a non-goal.
+
+  Severity::Pass and Severity::Unknown
+    -> The absence of a finding is not a finding.
+
+  Separate EgressMap field on Report
+    -> "Your data goes to two clouds" IS a finding; the tree is just its
+       evidence. One check, rich evidence, one less module.
+
+  --accept register with auto-reopen
+    -> A TOML comment and git blame already do this.
+
+  A new ai-memory-doctor crate up front
+    -> Scaffolding before value. Extract on the documented trigger.
+
+  26 checks in v1
+    -> The brew doctor failure mode, chosen deliberately.
+
+  --profile slices, --online version checks, --fix, --watch, --baseline
+    -> Nobody asked. See section 16.
+
+
+========================================================================
+16. DEFERRED — WITH THE TRIGGER FOR EACH
+========================================================================
+
+  --fix                    when 3+ findings have a fix that is a pure,
+                           reversible config write
+  --report (markdown)      when the first user asks for something to
+                           attach to an approval ticket
+  --online version check   when a support issue is traced to a stale
+                           binary
+  /admin/doctor route      after backlog item 1 reworks Capability; the
+                           route needs a capability decision
+  MCP tool                 not before v2 — triggers the 18-tool surface
+                           rule across MEMORY_INSTRUCTIONS, SNIPPET_BODY,
+                           README, docs and the both-surfaces regression
+                           tests
+  drift / --baseline       when --json has been stable for one release
+  extract the crate        second consumer, or ~800 lines
+  --profile                when someone asks. `--json | jq` covers it
+                           until then

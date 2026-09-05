@@ -1,0 +1,344 @@
+ai-memory doctor — PRODUCT VISION
+=================================
+
+PM framing, v1 concept. Written 2026-09-03 against the tree at commit
+47c9cf2. Companion to tasks_backlog.txt item 10.
+
+
+------------------------------------------------------------------------
+THE PROBLEM NOBODY'S NAMING
+------------------------------------------------------------------------
+
+ai-memory's core product risk isn't bugs. It's INVISIBILITY.
+
+It's a background daemon that silently captures data and silently fails.
+From the outside, four completely different states look IDENTICAL:
+
+  Reality                                    What the user sees
+  ----------------------------------------   ---------------------------
+  Capturing perfectly, consolidating         An agent that seems to
+  nightly                                    know things
+
+  Hooks installed but never firing           An agent that seems to
+                                             know things
+
+  Capturing everything, shipping every       An agent that seems to
+  page to OpenAI                             know things
+
+  Anonymous callers have full admin on       An agent that seems to
+  the socket                                 know things
+
+A user cannot distinguish "working" from "capturing nothing", or "safe"
+from "leaking". Both failure modes are silent, and both are expensive —
+one destroys the value prop, the other destroys trust.
+
+`doctor` is the product's OBSERVABILITY SURFACE FOR HUMANS. It's the
+single command that makes an invisible system legible.
+
+
+------------------------------------------------------------------------
+JOBS TO BE DONE
+------------------------------------------------------------------------
+
+Five distinct jobs, one command. The PM call is to unify them behind a
+default view with `--profile` slices, because the moment you split them
+into `ai-memory audit` / `ai-memory health` / `ai-memory privacy`,
+nobody runs any of them.
+
+ 1. "Did I install this right?"
+    Day 0. Hooks not firing is the #1 silent failure. Today the user
+    finds out three weeks later when memory is empty.
+
+ 2. "Is this safe to run HERE?"
+    On my laptop, yes. On the shared build box, on the client's machine,
+    in CI — different answer, and the tool knows enough to say so.
+
+ 3. "Why isn't memory working?"
+    Retrieval returns nothing. Is it no provider, stale embeddings, a
+    consolidation backlog, or a broken FTS index?
+
+ 4. "What is this actually storing about me?"
+    Transparency as a feature, not a docs page.
+
+ 5. "Prove it to my security team."
+    The artifact that ends the conversation.
+
+Job 5 is the one no competitor has, and it's the wedge into teams.
+
+
+------------------------------------------------------------------------
+POSITIONING — AND A REAL RISK
+------------------------------------------------------------------------
+
+`ai-memory status` already exists. If `doctor` overlaps it, both get
+ignored. The line has to be brutally clear:
+
+    `status` answers "what is it doing?"
+        counts, sessions, projects. Neutral reporting.
+
+    `doctor` answers "is it right?"
+        every output is a judgment with a fix attached.
+
+If a line in `doctor` has no verdict and no remedy, it belongs in
+`status`.
+
+
+------------------------------------------------------------------------
+DESIGN PRINCIPLES
+------------------------------------------------------------------------
+
+ 1. Verdict first, detail on demand.
+    One line at the top decides whether to keep reading.
+
+ 2. Every finding ships its fix.
+    A copy-pasteable command, not "consider enabling".
+
+ 3. Severity maps to a decision, not a feeling.
+    BLOCK = data at risk right now.
+    WARN  = works, but degraded or outside the supported model.
+    INFO  = you should know this.
+
+ 4. Prove it, don't assert it.
+    "Capture: OK" is a lie if nothing has arrived in six days. Every
+    green check is backed by a real number or a real timestamp.
+
+ 5. Never claim what it can't prove.
+    The sanitizer is a best-effort credential strip. doctor says
+    "12 patterns active, 4,102 redactions" — it never says "no secrets
+    stored".
+
+ 6. No network calls by default.
+    A privacy diagnostic that phones home would be self-refuting.
+    Version checks are `--online` only.
+
+ 7. Exit codes are the API.
+    0 clean, 1 warnings, 2 blocking. Drops into CI and pre-commit
+    unmodified.
+
+
+------------------------------------------------------------------------
+THE SCREEN
+------------------------------------------------------------------------
+
+$ ai-memory doctor
+
+  ai-memory 2.0.1   data ~/.ai-memory   up 3d 4h   pid 48192   57 checks
+
+  ╭────────────────────────────────────────────────────────────────────────╮
+  │  POSTURE: SHARED-HOST                              outside threat model│
+  │                                                                        │
+  │  2 blocking · 3 warnings · 52 passing                                  │
+  │  This install is capturing 31 repositories and sending page text to    │
+  │  two cloud providers. Admin routes accept unauthenticated callers.     │
+  ╰────────────────────────────────────────────────────────────────────────╯
+
+
+  WHERE YOUR DATA GOES ──────────────────────────────────── 4 destinations
+
+     prompts · tool inputs · file paths · tool results
+          │
+          ├─▶ disk    ~/.ai-memory/db/memory.sqlite      plaintext   0600 ✓
+          ├─▶ disk    ~/.ai-memory/wiki/**.md   (git)    plaintext   0700 ✓
+          │
+          ├─▶ cloud   api.anthropic.com    consolidation, auto-improve
+          │           └─ sends: session observations, assistant turns
+          │
+          └─▶ cloud   api.openai.com       embeddings
+                      └─ sends: full text of every page, on every write
+
+     Nothing else leaves this machine.   ai-memory doctor --profile egress
+
+
+  EXPOSURE ───────────────────────────────────────────────────── 1 blocking
+
+   ✗ EXP-002  Unauthenticated callers have full admin
+              bind 127.0.0.1:49374 · no auth token · no DB users
+              Any local process can call /admin/backup and download the
+              entire database, or /admin/purge-project and destroy it.
+              → ai-memory generate-auth-token
+              Seen: 0 admin calls in the last 7d.  ai-memory doctor --explain EXP-002
+
+   ✓ EXP-001  Bind address is loopback
+   ✓ EXP-004  Host allowlist set          localhost, 127.0.0.1, ::1
+   ✓ EXP-007  Request body cap active     10 MB
+
+
+  PRIVACY ─────────────────────────────────────────── 1 blocking · 1 warning
+
+   ✗ PRV-003  Cloud embeddings are sending every page verbatim
+              embedding_provider = "openai" · 1,284 pages · 4.1 MB shipped
+              A local 384-dim model is available and needs no API key.
+              → ai-memory config set embedding_provider=local  &&  ai-memory embed --rebuild
+
+   ⚠ PRV-001  Capture is opt-out; 12 of 31 repos have no marker
+              mode = denylist — a repo without .ai-memory.toml is captured.
+                  ~/work/acme-payments        1,847 obs   ← no marker
+                  ~/work/client-hipaa-portal    412 obs   ← no marker
+                  … 10 more                             --verbose
+              → ai-memory install-hooks --capture-mode allowlist
+
+   ✓ PRV-005  Assistant capture is off
+   ✓ PRV-006  Sanitizer active            12 patterns · 4,102 redactions · 0 invalid
+              Best-effort credential strip. Not DLP — see docs/privacy.md
+   ℹ PRV-009  No encryption at rest       by design; use FileVault / LUKS
+
+
+  MEMORY HEALTH ───────────────────────────────────────── everything working
+
+   ✓ HLT-001  Hooks firing                claude-code 2m ago · codex 4h ago
+   ✓ HLT-002  MCP reachable               18 tools · p50 34 ms
+   ✓ HLT-004  Consolidation current       0 pending · last run 41m ago
+   ✓ HLT-006  Retrieval sane              live probe returned 5 hits in 12 ms
+   ✓ HLT-008  Embedding coverage          1,284 / 1,284 pages · no dim drift
+   ⚠ HLT-011  Cursor hooks installed but never fired
+              Installed 6d ago. Zero events. The harness is likely not
+              loading them.
+              → ai-memory install-hooks --agent cursor --verify
+
+
+  DURABILITY ──────────────────────────────────────────────────── 1 warning
+
+   ⚠ DUR-002  No backup in 19 days        last: Aug 15 · 340 MB
+              → ai-memory backup ~/backups
+   ✓ DUR-001  SQLite integrity_check      ok · WAL 4.2 MB
+   ✓ DUR-003  Git checkpoints healthy     1,904 commits · last 41m ago
+   ✓ DUR-005  Disk headroom               412 GB free · +1.1 GB/mo projected
+              Raw observations never pruned (retention = 0). ~13 GB/yr.
+
+
+  ─────────────────────────────────────────────────────────────────────────
+   52 passing (--verbose)          2 blocking · 3 warnings          exit 2
+
+   Fix the safe subset      ai-memory doctor --fix
+   Report for your security team    ai-memory doctor --report > posture.md
+   Machine readable                 ai-memory doctor --json
+
+
+------------------------------------------------------------------------
+WHY EACH PART EARNS ITS PLACE
+------------------------------------------------------------------------
+
+THE POSTURE LABEL
+  SECURITY.md already defines the supported threat model — a
+  single-tenant workstation service. Nothing surfaces that at runtime.
+  Naming the posture (WORKSTATION / SHARED-HOST / LAN-EXPOSED /
+  UNPROTECTED) and stating whether it matches the supported model turns
+  a document nobody reads into a runtime verdict. I don't know another
+  tool that does this, and it's cheap because the threat model is
+  already written.
+
+THE EGRESS MAP
+  This is the screenshot that gets posted on Hacker News. "Where does my
+  data go" is the first question every security-conscious developer asks
+  about an AI memory tool, and today the answer requires reading three
+  config sections and knowing which ones interact. Rendering it as a
+  tree with actual destination hostnames and WHAT SPECIFICALLY gets sent
+  answers it in three seconds.
+
+STABLE FINDING IDs (EXP-002)
+  Small detail, disproportionate payoff. IDs make findings linkable in
+  tickets, greppable in docs, referenceable in support threads, and —
+  critically — POLICY-ABLE: an org can write "no EXP-* findings on any
+  developer machine" into a standard. That's how a CLI check becomes an
+  org-wide control.
+
+EVIDENCE ON GREEN CHECKS
+  "HLT-001 Hooks firing — claude-code 2m ago" is a fundamentally
+  different claim than "Hooks: OK". The second is a config read; the
+  first is proof the system is alive. HLT-011 catches the exact silent
+  failure — installed but never fired — that the product cannot
+  currently detect at all.
+
+--fix
+  Applies only reversible config changes, always with a diff and a
+  confirm. Never destructive, never touches data. The PRV-003 fix chains
+  a rebuild because a half-applied fix is worse than none.
+
+--report
+  The enterprise wedge. Timestamped markdown: posture, full check
+  results, egress map, accepted risks with their justifications,
+  versions. It's the thing an engineer attaches to a tooling-approval
+  ticket. Today that ticket takes two weeks of back-and-forth; with this
+  it takes one attachment.
+
+
+------------------------------------------------------------------------
+GUARDING AGAINST THE FAILURE MODE
+------------------------------------------------------------------------
+
+Every `doctor` command dies the same death: ALARM FATIGUE. Three
+warnings you've decided you don't care about, and you stop reading the
+output entirely.
+
+The mitigation is an ACCEPTED-RISK REGISTER:
+
+    $ ai-memory doctor --accept PRV-009 --reason "full-disk encryption via FileVault"
+      ✓ PRV-009 accepted by gabe on 2026-09-03. Shown as accepted in --report.
+
+Accepted findings drop out of the default view, still appear in
+`--report` under "Accepted Risks" with the reason and who signed off,
+and RE-OPEN AUTOMATICALLY if the underlying config changes. This is the
+difference between suppression (dangerous) and risk acceptance
+(auditable) — and it means the default view can stay honest without
+becoming noise.
+
+
+------------------------------------------------------------------------
+ROADMAP
+------------------------------------------------------------------------
+
+  v1    ~25 checks across the five domains, --verbose, --json, exit codes
+        SHIP CRITERIA: every check has a fix line. No check requires
+        network.
+
+  v1.1  --explain <id>, --profile, --accept, --report
+        SHIP CRITERIA: issue template requires `doctor --json` output
+
+  v1.2  --fix for the reversible subset; install-hooks runs doctor
+        automatically and shows the delta
+        SHIP CRITERIA: first-run ends in a green screen, not silence
+
+  v2    --watch live install verification; drift detection ("posture
+        changed 3d ago: embedding_provider local → openai"); --baseline
+        for CI
+        SHIP CRITERIA: teams gate merges on posture
+
+Drift detection in v2 is the sleeper feature. "Your posture changed and
+here's the diff" catches the case where someone flips a config in a
+hurry and nobody notices for a month.
+
+
+------------------------------------------------------------------------
+SUCCESS METRICS
+------------------------------------------------------------------------
+
+- ACTIVATION — % of installs reaching zero blocking findings within the
+  first session. Currently unmeasurable, which is the point.
+
+- SILENT-FAILURE KILL RATE — % of installs where hooks are installed but
+  have never fired, over time. Should trend hard toward zero once
+  HLT-011 exists.
+
+- SUPPORT DEFLECTION — % of GitHub issues resolved by the --json paste
+  in the template.
+
+- POSTURE DISTRIBUTION — share of installs in UNPROTECTED. This is the
+  number to put on a wall.
+
+- ENTERPRISE SIGNAL — --report invocations. It's the cleanest available
+  proxy for "someone is trying to get this approved at work", which is
+  exactly the funnel stage the project can't currently see.
+
+
+------------------------------------------------------------------------
+THE ONE-LINE PITCH
+------------------------------------------------------------------------
+
+    `ai-memory doctor` turns a silent background daemon into a system
+    you can see, judge, and defend — in one command, in under a second,
+    without a single network call.
+
+The strategic bet: for a tool that quietly records everything developers
+type, LEGIBILITY is the feature that makes it adoptable. Not more
+capture, not better ranking — the ability to look at it and know exactly
+what it's doing and where the data went.
